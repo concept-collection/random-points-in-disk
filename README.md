@@ -22,6 +22,20 @@ and how many points a target noise level would require.
 Statistics are computed only over voxels lying *entirely* inside the disk; boundary
 voxels have a smaller expected count and would otherwise inflate the measured spread.
 
+## Sampling backend
+
+Binning the points is the entire cost here and it parallelizes perfectly, so when WebGPU
+is available a compute shader draws the points and accumulates the histogram with atomics
+— which lifts the usable range from ~30M points to a billion. Coarse grids would
+serialize on a handful of global counters, so for 32×32 and below each workgroup
+accumulates into a private histogram in workgroup memory and flushes once per bin at the
+end. Random numbers come from a PCG hash seeded per thread; since this demo is *about*
+uniformity, that generator was checked against the 1/√μ prediction before being trusted
+(a hash with visible structure would paint that structure straight into the heatmap).
+
+There is a plain-JS fallback for browsers without WebGPU, and the badge next to
+"New sample" shows which backend is live. The point count is capped lower on the CPU path.
+
 ## Motivation
 
 This is the discretization question behind isochromat-based MRI simulation: a voxel's

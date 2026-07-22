@@ -48,6 +48,12 @@
   select { width: 100%; }
   button { cursor: pointer; white-space: nowrap; }
   button:hover { border-color: var(--accent); }
+  .badge {
+    font-size: .72rem; letter-spacing: .06em; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 20px; white-space: nowrap;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  .badge.on { border-color: #2e7d5b; color: #6ddba4; }
 
   /* ---- panels ---- */
   .panels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 14px 0; }
@@ -106,7 +112,10 @@
         <option value="512">512 &times; 512</option>
       </select>
     </div>
-    <div><button id="resample">New sample</button></div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <button id="resample">New sample</button>
+      <span class="badge" id="backend" title="Points are binned by a WebGPU compute shader when available, otherwise on the CPU">CPU</span>
+    </div>
   </div>
 
   <div class="panels">
@@ -294,6 +303,153 @@ function fmtPct(x) {
   return (x * 100).toFixed(2) + '%';
 }
 
+// ---------- GPU sampling ----------
+// The histogram is the whole cost of this demo, and it is embarrassingly parallel: one
+// compute shader draws the points and atomically bins them, so N can reach a billion.
+// The CPU path above stays as the fallback.
+const MAX_G = 512, MAX_BINS = MAX_G * MAX_G;
+const WG_SIZE = 256, WORKGROUPS = 1024;   // 262144 grid-stride threads
+const LOCAL_BINS = 1024;                  // workgroup-private histogram, for G <= 32
+
+const WGSL = `
+struct Params { g: u32, n: u32, seed: u32, use_local: u32 }
+@group(0) @binding(0) var<uniform> P: Params;
+@group(0) @binding(1) var<storage, read_write> counts: array<atomic<u32>>;
+
+// Coarse grids would serialize on a handful of global counters, so each workgroup
+// accumulates privately and flushes once per bin at the end.
+var<workgroup> local_hist: array<atomic<u32>, ${LOCAL_BINS}>;
+
+// PCG (rxs-m-xs). Validated against the Poisson prediction before being trusted here:
+// a hash with visible structure would paint that structure straight into the heatmap.
+fn hash(x: u32) -> u32 {
+  var s = x * 747796405u + 2891336453u;
+  s = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (s >> 22u) ^ s;
+}
+fn pcg(state: ptr<function, u32>) -> u32 {
+  let old = *state;
+  *state = old * 747796405u + 2891336453u;
+  let word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+const INV32: f32 = 2.3283064365386963e-10;
+const TAU: f32 = 6.283185307179586;
+
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+  let nbins = P.g * P.g;
+  let use_local = P.use_local == 1u;
+
+  if (use_local) {
+    for (var i = lid.x; i < nbins; i = i + ${WG_SIZE}u) {
+      atomicStore(&local_hist[i], 0u);
+    }
+  }
+  workgroupBarrier();
+
+  var state = hash(gid.x ^ hash(P.seed));
+  let stride = nwg.x * ${WG_SIZE}u;
+  let half = f32(P.g) * 0.5;
+  let top = f32(P.g) - 1.0;
+
+  for (var idx = gid.x; idx < P.n; idx = idx + stride) {
+    let r = sqrt(f32(pcg(&state)) * INV32);        // sqrt for uniform area density
+    let t = TAU * f32(pcg(&state)) * INV32;
+    let ix = u32(clamp((r * cos(t) + 1.0) * half, 0.0, top));
+    let iy = u32(clamp((r * sin(t) + 1.0) * half, 0.0, top));
+    let bin = iy * P.g + ix;
+    if (use_local) { atomicAdd(&local_hist[bin], 1u); }
+    else { atomicAdd(&counts[bin], 1u); }
+  }
+
+  workgroupBarrier();
+  if (use_local) {
+    for (var i = lid.x; i < nbins; i = i + ${WG_SIZE}u) {
+      let v = atomicLoad(&local_hist[i]);
+      if (v > 0u) { atomicAdd(&counts[i], v); }
+    }
+  }
+}
+`;
+
+let gpu = null;
+let seed = 1;
+
+async function initGPU() {
+  if (!navigator.gpu) return null;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return null;
+    const device = await adapter.requestDevice();
+    const module = device.createShaderModule({ code: WGSL });
+    if (module.getCompilationInfo) {
+      const info = await module.getCompilationInfo();
+      const errs = info.messages.filter((m) => m.type === 'error');
+      if (errs.length) { console.error('WGSL compilation failed', errs); return null; }
+    }
+    const pipeline = device.createComputePipeline({
+      layout: 'auto', compute: { module, entryPoint: 'main' },
+    });
+    const U = GPUBufferUsage;
+    const params = device.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST });
+    const counts = device.createBuffer({ size: MAX_BINS * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+    const stage = device.createBuffer({ size: MAX_BINS * 4, usage: U.COPY_DST | U.MAP_READ });
+    const bind = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: counts } },
+      ],
+    });
+    device.addEventListener('uncapturederror', (e) => console.error('WebGPU error', e.error));
+    device.lost.then(() => { gpu = null; showBackend(); });
+    return { device, pipeline, params, counts, stage, bind, host: new Uint32Array(MAX_BINS) };
+  } catch (e) {
+    console.warn('WebGPU unavailable', e);
+    return null;
+  }
+}
+
+async function gpuCounts(N, G) {
+  const g = gpu;
+  const bytes = G * G * 4;
+  g.device.queue.writeBuffer(g.params, 0,
+    new Uint32Array([G, N, seed, G * G <= LOCAL_BINS ? 1 : 0]));
+  const enc = g.device.createCommandEncoder();
+  enc.clearBuffer(g.counts, 0, bytes);
+  const pass = enc.beginComputePass();
+  pass.setPipeline(g.pipeline);
+  pass.setBindGroup(0, g.bind);
+  pass.dispatchWorkgroups(WORKGROUPS);
+  pass.end();
+  enc.copyBufferToBuffer(g.counts, 0, g.stage, 0, bytes);
+  g.device.queue.submit([enc.finish()]);
+  await g.stage.mapAsync(GPUMapMode.READ, 0, bytes);
+  g.host.set(new Uint32Array(g.stage.getMappedRange(0, bytes)));
+  g.stage.unmap();
+  return g.host;   // only [0, G*G) is meaningful
+}
+
+// Falls back permanently to the CPU if the GPU path ever throws mid-session. Returns null
+// in that case rather than sampling: N may be far above what the CPU can take, so the
+// caller re-runs after showBackend() has clamped the slider back to the CPU range.
+async function getCounts(N, G) {
+  if (gpu) {
+    try { return await gpuCounts(N, G); }
+    catch (e) {
+      console.warn('GPU sampling failed, falling back to CPU', e);
+      gpu = null;
+      showBackend();
+      return null;
+    }
+  }
+  return sampleCounts(N, G);
+}
+
 // ---------- app ----------
 const el = (id) => document.getElementById(id);
 const nSlider = el('n'), resSel = el('res'), targetSel = el('target');
@@ -314,9 +470,21 @@ function showN(N) {
   el('nInline').textContent = fmtCount(N);
 }
 
+// The CPU tops out around 30M points before a drag becomes unpleasant; the GPU
+// comfortably reaches a billion, which is where fine grids get interesting.
+const CPU_MAX = 750, GPU_MAX = 900;   // slider units, = log10(N) * 100
+
+function showBackend() {
+  el('backend').textContent = gpu ? 'WebGPU' : 'CPU';
+  el('backend').className = 'badge' + (gpu ? ' on' : '');
+  const max = gpu ? GPU_MAX : CPU_MAX;
+  nSlider.max = String(max);
+  if (+nSlider.value > max) nSlider.value = String(max);
+}
+
 let lastElapsed = 0;
 
-function update() {
+async function draw() {
   const N = sliderToN(+nSlider.value);
   const G = +resSel.value;
 
@@ -324,7 +492,8 @@ function update() {
 
   const frac = areaFractions(G);
   const t0 = performance.now();
-  const counts = sampleCounts(N, G);
+  const counts = await getCounts(N, G);
+  if (!counts) { queued = true; return; }   // backend just changed; redraw within the new limits
   const elapsed = lastElapsed = performance.now() - t0;
 
   // Expected count in a fully interior voxel: N * (voxel area / disk area).
@@ -363,7 +532,22 @@ function update() {
   const need = Math.PI * G * G / (4 * c * c);
   el('sNeed').innerHTML = fmtCount(Math.round(need)) + ' <small>points</small>';
 
-  el('sTime').innerHTML = (elapsed < 10 ? elapsed.toFixed(1) : elapsed.toFixed(0)) + ' <small>ms</small>';
+  el('sTime').innerHTML = (elapsed < 10 ? elapsed.toFixed(1) : elapsed.toFixed(0))
+    + ' <small>ms · ' + (gpu ? 'GPU' : 'CPU') + '</small>';
+}
+
+// Sampling is async now, so serialize runs and collapse anything that arrives while one
+// is in flight down to a single trailing update.
+let running = false, queued = false;
+async function update() {
+  if (running) { queued = true; return; }
+  running = true;
+  try { await draw(); }
+  catch (e) { console.error(e); }
+  finally {
+    running = false;
+    if (queued) { queued = false; schedule(); }
+  }
 }
 
 // Coalesce rapid input into one update per frame; once a sample gets slow enough to
@@ -384,8 +568,17 @@ function schedule() {
 nSlider.addEventListener('input', () => { showN(sliderToN(+nSlider.value)); schedule(); });
 resSel.addEventListener('change', schedule);
 targetSel.addEventListener('change', schedule);
-el('resample').addEventListener('click', update);
+el('resample').addEventListener('click', () => { seed++; update(); });
+
+// Draw immediately on the CPU so the page is never blank, then upgrade to the GPU.
+showBackend();
 update();
+initGPU().then((g) => {
+  if (!g) return;
+  gpu = g;
+  showBackend();
+  update();
+});
 </script>
 </body>
 </html>
