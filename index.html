@@ -377,19 +377,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 `;
 
 let gpu = null;
+let gpuReason = '';   // why the GPU path is unavailable, surfaced on the badge tooltip
 let seed = 1;
 
 async function initGPU() {
-  if (!navigator.gpu) return null;
+  if (!navigator.gpu) {
+    gpuReason = 'navigator.gpu is undefined — this browser exposes no WebGPU.';
+    console.warn('WebGPU: ' + gpuReason);
+    return null;
+  }
   try {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) return null;
+    // A software adapter is still much faster than the JS path, so take one if offered.
+    let adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) adapter = await navigator.gpu.requestAdapter({ forceFallbackAdapter: true });
+    if (!adapter) {
+      gpuReason = 'requestAdapter() returned null — no WebGPU adapter available. '
+        + 'On Linux, Chrome needs its Vulkan backend: try enabling chrome://flags/#enable-unsafe-webgpu, '
+        + 'and check chrome://gpu for the WebGPU and Vulkan rows.';
+      console.warn('WebGPU: ' + gpuReason);
+      return null;
+    }
     const device = await adapter.requestDevice();
     const module = device.createShaderModule({ code: WGSL });
     if (module.getCompilationInfo) {
       const info = await module.getCompilationInfo();
       const errs = info.messages.filter((m) => m.type === 'error');
-      if (errs.length) { console.error('WGSL compilation failed', errs); return null; }
+      if (errs.length) {
+        gpuReason = 'the compute shader failed to compile; see the console.';
+        console.error('WGSL compilation failed', errs);
+        return null;
+      }
     }
     const pipeline = device.createComputePipeline({
       layout: 'auto', compute: { module, entryPoint: 'main' },
@@ -409,6 +426,7 @@ async function initGPU() {
     device.lost.then(() => { gpu = null; showBackend(); });
     return { device, pipeline, params, counts, stage, bind, host: new Uint32Array(MAX_BINS) };
   } catch (e) {
+    gpuReason = 'WebGPU initialization threw: ' + e;
     console.warn('WebGPU unavailable', e);
     return null;
   }
@@ -475,8 +493,12 @@ function showN(N) {
 const CPU_MAX = 750, GPU_MAX = 900;   // slider units, = log10(N) * 100
 
 function showBackend() {
-  el('backend').textContent = gpu ? 'WebGPU' : 'CPU';
-  el('backend').className = 'badge' + (gpu ? ' on' : '');
+  const b = el('backend');
+  b.textContent = gpu ? 'WebGPU' : 'CPU';
+  b.className = 'badge' + (gpu ? ' on' : '');
+  b.title = gpu
+    ? 'Points are binned by a WebGPU compute shader.'
+    : 'Binning on the CPU because ' + (gpuReason || 'the GPU path has not initialized yet.');
   const max = gpu ? GPU_MAX : CPU_MAX;
   nSlider.max = String(max);
   if (+nSlider.value > max) nSlider.value = String(max);
